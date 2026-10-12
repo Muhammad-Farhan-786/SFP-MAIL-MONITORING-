@@ -1,0 +1,1 @@
+The Celery worker and beat entry points live in `backend/app/worker.py`, sharing the same versioned backend image and database schema. Compose runs them as separate processes. Redis provides the queue; PostgreSQL advisory locks serialize monitoring groups. Run exactly one beat service. Task dispatch intervals are database-backed and editable from Settings.
