@@ -18,6 +18,22 @@ class Config(BaseSettings):
     smtp_password: str = ""
     smtp_from: str = ""
     alert_recipients: str = ""
+    alert_enabled: bool = True
+    alert_reminder_seconds: int = 300
+    auth_interval_seconds: int = 300
+    smtp_interval_seconds: int = 300
+    reputation_interval_seconds: int = 43200
+    blacklist_interval_seconds: int = 43200
+    placement_interval_seconds: int = 86400
+    dashboard_url: str = "https://nhmdashboards.com/email-monitoring/"
+    seed_smtp_host: str = ""
+    seed_smtp_port: int = 587
+    seed_smtp_user: str = ""
+    seed_smtp_password: str = ""
+    seed_smtp_from: str = ""
+    seed_sending_source: str = (
+        "Dedicated authorized seed SMTP; production equivalence not verified"
+    )
     delivery_webhook_secret: str = ""
     abuseipdb_key: str = ""
     domain_reputation_url: str = ""

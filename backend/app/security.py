@@ -42,7 +42,11 @@ def current_user(request: Request, db=Depends(get_db)):
             raise ValueError()
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             token = request.headers.get("X-CSRF-Token", "")
-            if not token or not secrets.compare_digest(token, payload.get("csrf", "")):
+            if (
+                not token
+                or not token.isascii()
+                or not secrets.compare_digest(token, payload.get("csrf", ""))
+            ):
                 raise HTTPException(403, "Invalid CSRF token")
         return user
     except HTTPException:

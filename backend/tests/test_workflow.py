@@ -102,7 +102,9 @@ def test_email_outbox_delivery(db, monkeypatch):
 
     monkeypatch.setattr(worker, "Session", lambda: nullcontext(db))
     monkeypatch.setattr(worker.mail, "send", lambda *args: True)
-    deliver_alerts.run()
+    from app.alerts import send_outbox
+
+    send_outbox(db)
     alert = db.scalar(select(Alert))
     assert alert.state == "Sent" and alert.sent_at
 

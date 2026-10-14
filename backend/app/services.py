@@ -4,12 +4,14 @@ from sqlalchemy import select, func
 from .models import *
 from . import monitoring
 from .config import config
+from .diagnostics import diagnose
 
 WEIGHTS = {
     "SPF": 12,
     "DKIM": 12,
     "DMARC": 12,
     "MX": 6,
+    "PTR": 4,
     "SMTP": 8,
     "TLS": 8,
     "Delivery Rate": 10,
@@ -20,12 +22,13 @@ WEIGHTS = {
     "Inbox Placement": 8,
 }
 INTERVALS = {
-    "auth": 21600,
-    "smtp": 3600,
+    "auth": 300,
+    "smtp": 300,
     "reputation": 43200,
     "blacklist": 43200,
     "placement": 86400,
     "reports": 86400,
+    "delivery": 300,
 }
 CATEGORY_GROUP = {
     "SPF": "auth",
@@ -54,8 +57,14 @@ def audit(db, actor, action, **detail):
 
 def preferences(db):
     obj = db.get(Setting, "monitoring")
-    return {
-        "intervals": INTERVALS,
+    result = {
+        "intervals": {
+            **INTERVALS,
+            **{
+                k: getattr(config(), k + "_interval_seconds", v)
+                for k, v in INTERVALS.items()
+            },
+        },
         "bounce_threshold": 5,
         "failure_threshold": 5,
         "alert_cooldown": 3600,
@@ -63,19 +72,34 @@ def preferences(db):
         "health_excellent": 95,
         **(obj.value if obj else {}),
     }
+    result["intervals"] = {**INTERVALS, **result["intervals"]}
+    return result
 
 
 def latest_checks(db, domain_id):
+    ranked = (
+        select(
+            Check.id,
+            func.row_number()
+            .over(
+                partition_by=Check.category,
+                order_by=(Check.checked_at.desc(), Check.id.desc()),
+            )
+            .label("position"),
+        )
+        .where(
+            Check.domain_id == domain_id,
+            Check.demo.is_(config().demo_mode),
+            Check.category != "Health Score",
+        )
+        .subquery()
+    )
     query = (
         select(Check)
-        .where(Check.domain_id == domain_id, Check.demo.is_(config().demo_mode))
-        .order_by(Check.checked_at.desc(), Check.id.desc())
+        .join(ranked, Check.id == ranked.c.id)
+        .where(ranked.c.position == 1)
     )
-    latest = {}
-    for check in db.scalars(query):
-        if check.category not in latest and check.category != "Health Score":
-            latest[check.category] = check
-    return latest
+    return {check.category: check for check in db.scalars(query)}
 
 
 def alignment(events, field):
@@ -92,7 +116,10 @@ def delivery_stats(events):
 
     return {
         "total": total,
-        "delivered": counts["delivered"],
+        "delivered": counts["delivered"] if total else None,
+        "measurement_state": "Measured" if total else "Not Measured",
+        "complaints": counts["complaint"] if total else None,
+        "deferred": counts["deferred"] + counts["temporary_failure"] if total else None,
         "delivery_rate": pct(counts["delivered"]),
         "bounce_rate": pct(counts["hard_bounce"] + counts["soft_bounce"]),
         "hard_bounce_rate": pct(counts["hard_bounce"]),
@@ -132,6 +159,12 @@ def health_score(checks, critical_issues=0):
     earned = sum(f["earned"] or 0 for f in factors)
     penalty = min(20, critical_issues * 5)
     score = max(0, round(earned / known * 100) - penalty) if known else None
+    for factor in factors:
+        factor["reduction"] = (
+            round(100 * (factor["weight"] - factor["earned"]) / known, 2)
+            if factor["earned"] is not None and known
+            else None
+        )
     return {
         "score": score,
         "coverage": round(known / sum(WEIGHTS.values()) * 100),
@@ -149,14 +182,27 @@ def snapshot(db, domain_id, days=7):
         check = latest.get(category)
         state = check.state if check else "Never Checked"
         summary = check.summary if check else "No measurements yet."
+        availability = (
+            "Missing"
+            if not check
+            else "Not Configured"
+            if state == "Not Configured"
+            else "Unsupported"
+            if state == "Unsupported"
+            else "Unknown"
+            if state == "Unknown"
+            else "Measured"
+        )
         if check and now() - aware(check.checked_at) > timedelta(
             seconds=prefs["intervals"].get(CATEGORY_GROUP.get(category, ""), 86400) * 2
         ):
             state = "Unknown"
+            availability = "Stale"
             summary = "This measurement is stale. Run a new check."
         cards.append(
             {
                 "category": category,
+                "availability": availability,
                 "state": state,
                 "summary": summary,
                 "checked_at": check.checked_at if check else None,
@@ -170,7 +216,12 @@ def snapshot(db, domain_id, days=7):
     )
     score = health_score(
         {c["category"]: c for c in cards},
-        sum(i.severity == "Critical" and i.status != "Verified" for i in active),
+        sum(
+            i.severity == "Critical"
+            and i.status != "Verified"
+            and i.observed_state != "Healthy"
+            for i in active
+        ),
     )
     state = (
         "Unknown"
@@ -179,7 +230,7 @@ def snapshot(db, domain_id, days=7):
         if score["score"] >= prefs["health_excellent"]
         else "Healthy"
         if score["score"] >= prefs["health_healthy"]
-        else "Needs Attention"
+        else "Warning"
         if score["score"] >= 50
         else "Critical"
     )
@@ -222,6 +273,7 @@ def snapshot(db, domain_id, days=7):
             ),
             "verified": sum(i.status == "Verified" for i in active),
         },
+        "scans": scan_status(db, domain_id, prefs),
         "placements": [
             {**serialize(p), "provider": db.get(SeedMailbox, p.seed_id).provider}
             for p in placements
@@ -279,11 +331,18 @@ def record(db, domain_id, category, data):
         domain_id=domain_id,
         check_id=check.id,
     )
-    failed = check.state in ("Critical", "Warning")
+    failed = check.state in (
+        "Critical",
+        "Warning",
+        "Unknown",
+        "Not Configured",
+        "Not Measured",
+    )
     changed = (
         previous is not None
         and category in ("SPF", "DKIM", "DMARC", "MX")
-        and previous.evidence != check.evidence
+        and {k: v for k, v in previous.evidence.items() if k != "message_alignment"}
+        != {k: v for k, v in check.evidence.items() if k != "message_alignment"}
         and previous.state == "Healthy"
     )
     fingerprint = f"{domain_id}:{category}"
@@ -300,7 +359,11 @@ def record(db, domain_id, category, data):
                 severity="Critical" if check.state == "Critical" else "Medium",
                 technical=check.summary,
                 meaning="This signal may affect whether customers receive your email reliably.",
-                action="Review the evidence with your email provider, correct the configuration, then request a retest.",
+                action="\n".join(
+                    diagnose(category, check.state, check.summary, check.evidence)[
+                        "solution_steps"
+                    ]
+                ),
                 impact="Messages may be delayed, rejected, or placed in spam.",
                 evidence=check.evidence,
             )
@@ -332,16 +395,35 @@ def record(db, domain_id, category, data):
             issue.technical = check.summary
             issue.evidence = check.evidence
             issue.severity = "Critical" if check.state == "Critical" else "Medium"
-        cooldown = preferences(db)["alert_cooldown"]
-        recent = db.scalar(
-            select(Alert).where(
-                Alert.issue_id == issue.id,
-                Alert.created_at > now() - timedelta(seconds=cooldown),
+        issue.observed_state = check.state
+        issue.recovered_at = None
+        issue.diagnosis = diagnose(category, check.state, check.summary, check.evidence)
+        issue.action = "\n".join(issue.diagnosis["solution_steps"])
+        issue.meaning = check.summary
+        issue.severity = (
+            "Critical"
+            if check.state == "Critical"
+            else "Medium"
+            if check.state == "Warning"
+            else "Low"
+        )
+    elif issue and check.state == "Healthy" and issue.observed_state != "Healthy":
+        from .alerts import queue_recovery
+
+        issue.observed_state = "Healthy"
+        issue.recovered_at = check.checked_at
+        db.add(
+            IssueHistory(
+                issue_id=issue.id,
+                status=issue.status,
+                actor="monitor",
+                note="Healthy recovery observed; retest verification still required before closure",
             )
         )
-        if not recent:
-            db.add(Alert(issue_id=issue.id))
-            audit(db, "monitor", "Alert generated", issue_id=issue.id)
+        queue_recovery(db, issue, check)
+    from .alerts import enqueue_digest
+
+    enqueue_digest(db, domain_id)
     return check
 
 
@@ -365,6 +447,9 @@ def execute_group(db, domain, group):
             },
         )
     )
+    from .alerts import enqueue_digest
+
+    enqueue_digest(db, domain.id)
     db.commit()
     return checks
 
@@ -421,3 +506,28 @@ def verify_retest(db, issue, check, actor):
     )
     audit(db, actor, "Issue retest completed", issue_id=issue.id, success=bool(success))
     return bool(success)
+
+
+def scan_status(db, domain_id, prefs=None):
+    prefs = prefs or preferences(db)
+    jobs = {
+        j.group: j
+        for j in db.scalars(select(ScanJob).where(ScanJob.domain_id == domain_id))
+    }
+    return [
+        {
+            "group": group,
+            "interval_seconds": seconds,
+            **(
+                serialize(jobs[group])
+                if group in jobs
+                else {
+                    "state": "Never Checked",
+                    "last_success_at": None,
+                    "next_due_at": None,
+                    "duration_seconds": None,
+                }
+            ),
+        }
+        for group, seconds in prefs["intervals"].items()
+    ]

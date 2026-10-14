@@ -1,4 +1,4 @@
-import json, hmac, hashlib, time, secrets, logging
+import json, hmac, hashlib, time, secrets, logging, re
 from collections import defaultdict
 from datetime import timedelta
 from contextlib import asynccontextmanager
@@ -15,6 +15,8 @@ from .schemas import *
 from .security import current_user, admin, password_ok, hasher, create_token, encrypt
 from .services import snapshot, serialize, preferences, transition, audit, aware
 from .worker import monitor, retest, celery
+from . import scheduling
+from .alerts import alert_preferences, settings_row, suppress_queued, enqueue_digest
 
 log = logging.getLogger("email-health")
 cache = redis.Redis.from_url(config().redis_url)
@@ -175,15 +177,28 @@ def overview(
 
 @app.post("/api/monitor/{domain_id}/{group}")
 def launch(domain_id: int, group: str, db=Depends(get_db), user=Depends(admin)):
-    if group not in ("auth", "smtp", "reputation", "blacklist", "placement", "reports"):
+    if group not in (
+        "auth",
+        "smtp",
+        "reputation",
+        "blacklist",
+        "placement",
+        "reports",
+        "delivery",
+    ):
         raise HTTPException(422, "Unknown monitor group")
     if not db.get(Domain, domain_id):
         raise HTTPException(404, "Domain not found")
     limit(f"monitor:{domain_id}:{group}", 2, 300)
-    task = monitor.delay(domain_id, group)
+    job = scheduling.reserve(db, domain_id, group, manual=True)
+    if not job:
+        raise HTTPException(
+            409, "A scan for this category is already queued or running"
+        )
+    task_id = scheduling.publish(db, job, monitor)
     audit(db, user.email, "Monitoring requested", domain_id=domain_id, group=group)
     db.commit()
-    return {"task_id": task.id, "state": "Queued"}
+    return {"task_id": task_id, "state": job.state}
 
 
 @app.get("/api/history/{domain_id}")
@@ -201,7 +216,7 @@ def history(
                 Check.demo.is_(config().demo_mode),
                 Check.checked_at >= since,
             )
-            .order_by(Check.checked_at)
+            .order_by(Check.checked_at.desc(), Check.id.desc())
             .limit(10000)
         )
     )
@@ -213,10 +228,12 @@ def history(
                 DeliveryEvent.demo.is_(config().demo_mode),
                 DeliveryEvent.occurred_at >= since,
             )
-            .order_by(DeliveryEvent.occurred_at)
+            .order_by(DeliveryEvent.occurred_at.desc(), DeliveryEvent.id.desc())
             .limit(100000)
         )
     )
+    checks.reverse()
+    events.reverse()
     issues = list(
         db.scalars(
             select(Issue).where(
@@ -278,7 +295,9 @@ def history(
                 "health": b["health"],
                 "delivery_rate": stats["delivery_rate"],
                 "bounce_rate": stats["bounce_rate"],
-                "failures": stats["total"] - stats["delivered"],
+                "failures": stats["total"] - stats["delivered"]
+                if stats["total"]
+                else None,
                 "authentication": round(
                     sum(e.spf_pass is True or e.dkim_pass is True for e in auth)
                     / len(auth)
@@ -287,8 +306,12 @@ def history(
                 )
                 if auth
                 else None,
-                "inbox": sum(p.state == "Inbox" for p in b["placement"]),
-                "spam": sum(p.state == "Spam" for p in b["placement"]),
+                "inbox": sum(p.state == "Inbox" for p in b["placement"])
+                if b["placement"]
+                else None,
+                "spam": sum(p.state == "Spam" for p in b["placement"])
+                if b["placement"]
+                else None,
                 "reputation": b["reputation"],
                 "issues": b["issues"],
             }
@@ -380,6 +403,7 @@ def settings(domain_id: int, db=Depends(get_db), user=Depends(admin)):
     cfg = config()
     return {
         "monitoring": preferences(db),
+        "alerts": alert_preferences(db, domain_id),
         "domain": serialize(db.get(Domain, domain_id))
         if db.get(Domain, domain_id)
         else None,
@@ -396,7 +420,9 @@ def settings(domain_id: int, db=Depends(get_db), user=Depends(admin)):
         ],
         "integrations": {
             "SMTP": bool(cfg.smtp_host and cfg.smtp_from),
-            "Email alerts": bool(cfg.smtp_host and cfg.alert_recipients),
+            "Email alerts": bool(
+                cfg.smtp_host and alert_preferences(db, domain_id)["recipients"]
+            ),
             "AbuseIPDB": bool(cfg.abuseipdb_key),
             "DNSBL": bool(cfg.dnsbl_zones or cfg.domain_dnsbl_zones),
             "Domain reputation": bool(cfg.domain_reputation_url),
@@ -426,8 +452,27 @@ def add_seed(domain_id: int, data: SeedInput, db=Depends(get_db), user=Depends(a
         raise HTTPException(404, "Domain not found")
     seed = SeedMailbox(
         domain_id=domain_id,
-        **data.model_dump(exclude={"password"}),
-        encrypted_password=encrypt(data.password),
+        **data.model_dump(
+            exclude={
+                "password",
+                "oauth_client_id",
+                "oauth_client_secret",
+                "oauth_refresh_token",
+                "oauth_tenant",
+            }
+        ),
+        encrypted_password=encrypt(
+            data.password
+            if data.auth_method == "password"
+            else json.dumps(
+                {
+                    "client_id": data.oauth_client_id,
+                    "client_secret": data.oauth_client_secret,
+                    "refresh_token": data.oauth_refresh_token,
+                    "tenant": data.oauth_tenant,
+                }
+            )
+        ),
     )
     db.add(seed)
     audit(db, user.email, "Seed mailbox added", provider=data.provider)
@@ -477,6 +522,10 @@ async def delivery(request: Request, db=Depends(get_db)):
         raise HTTPException(413, "Request too large")
     stamp = request.headers.get("X-Event-Timestamp", "")
     signature = request.headers.get("X-Event-Signature", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", signature) or not re.fullmatch(
+        r"[0-9]{1,12}", stamp
+    ):
+        raise HTTPException(401, "Invalid signature headers")
     try:
         if abs(time.time() - int(stamp)) > 300:
             raise ValueError()
@@ -496,14 +545,38 @@ async def delivery(request: Request, db=Depends(get_db)):
     domain = db.scalar(select(Domain).where(Domain.name == data.domain))
     if not domain:
         raise HTTPException(404, "Domain is not monitored")
+    payload_hash = hashlib.sha256(data.model_dump_json().encode()).hexdigest()
     existing = db.scalar(
         select(DeliveryEvent).where(DeliveryEvent.event_id == data.event_id)
     )
     if existing:
+        if (
+            existing.domain_id != domain.id
+            or existing.payload_hash
+            and existing.payload_hash != payload_hash
+        ):
+            raise HTTPException(409, "Event ID already used with a different payload")
         return {"id": existing.id, "duplicate": True}
-    obj = DeliveryEvent(domain_id=domain.id, **data.model_dump(exclude={"domain"}))
+    obj = DeliveryEvent(
+        domain_id=domain.id,
+        payload_hash=payload_hash,
+        **data.model_dump(exclude={"domain"}),
+    )
     db.add(obj)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing = db.scalar(
+            select(DeliveryEvent).where(DeliveryEvent.event_id == data.event_id)
+        )
+        if (
+            existing
+            and existing.domain_id == domain.id
+            and existing.payload_hash == payload_hash
+        ):
+            return {"id": existing.id, "duplicate": True}
+        raise HTTPException(409, "Conflicting delivery event")
     if data.kind in ("hard_bounce", "soft_bounce"):
         db.add(Bounce(event_id=obj.id, kind=data.kind, reason=data.reason))
     audit(db, "webhook", "Delivery event received", kind=data.kind, domain_id=domain.id)
@@ -575,3 +648,78 @@ def system(db=Depends(get_db), user=Depends(current_user)):
             )
         ],
     }
+
+
+@app.get("/api/alerts/{domain_id}")
+def alerts_status(domain_id: int, db=Depends(get_db), user=Depends(current_user)):
+    if not db.get(Domain, domain_id):
+        raise HTTPException(404, "Domain not found")
+    rows = list(
+        db.scalars(
+            select(Alert)
+            .where(Alert.domain_id == domain_id)
+            .order_by(Alert.created_at.desc())
+            .limit(100)
+        )
+    )
+    result = {
+        "history": [serialize(a) for a in rows],
+        "last_sent": next((a.sent_at for a in rows if a.sent_at), None),
+        "last_delivery_status": rows[0].state if rows else "Never Sent",
+    }
+    if user.role == "admin":
+        result["settings"] = alert_preferences(db, domain_id)
+    return result
+
+
+@app.put("/api/alerts/{domain_id}/settings")
+def save_alerts(
+    domain_id: int, data: AlertSettingsInput, db=Depends(get_db), user=Depends(admin)
+):
+    if not db.get(Domain, domain_id):
+        raise HTTPException(404, "Domain not found")
+    row = settings_row(db, domain_id)
+    prefs = {**data.model_dump(), "revision": row.value.get("revision", 0) + 1}
+    row.value = prefs
+    suppress_queued(db, domain_id, prefs)
+    audit(
+        db,
+        user.email,
+        "Alert policy changed",
+        domain_id=domain_id,
+        enabled=data.enabled,
+        paused=data.paused,
+    )
+    db.commit()
+    return prefs
+
+
+@app.post("/api/alerts/{domain_id}/test")
+def test_alert(domain_id: int, db=Depends(get_db), user=Depends(admin)):
+    domain = db.get(Domain, domain_id)
+    if not domain:
+        raise HTTPException(404, "Domain not found")
+    limit(f"alert-test:{domain_id}", 2, 300)
+    prefs = alert_preferences(db, domain_id)
+    if not prefs["recipients"]:
+        raise HTTPException(422, "Configure alert recipients first")
+    if not config().smtp_host or not config().smtp_from:
+        raise HTTPException(422, "Configure notification SMTP first")
+    import uuid
+
+    obj = Alert(
+        domain_id=domain_id,
+        kind="Test",
+        dedup_key="test:" + uuid.uuid4().hex,
+        next_attempt_at=now(),
+        payload={
+            "critical": False,
+            "subject": f"[SFP EMAIL HEALTH TEST] {domain.name}",
+            "body": f"This is an explicitly requested notification delivery test, not an email health measurement.\nGenerated: {now().isoformat()}\nDashboard: {config().dashboard_url}",
+        },
+    )
+    db.add(obj)
+    db.flush()
+    audit(db, user.email, "Alert test requested", domain_id=domain_id, alert_id=obj.id)
+    db.commit()
+    return {"id": obj.id, "state": obj.state}

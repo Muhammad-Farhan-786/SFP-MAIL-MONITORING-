@@ -6,7 +6,7 @@ test.beforeEach(async ({ page }) => {
     throw new Error(
       "Set E2E_EMAIL and E2E_PASSWORD through your secure environment",
     );
-  await page.goto("/");
+  await page.goto("./");
   await page.getByLabel("Email address").fill(email);
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByRole("button", { name: "Sign in to dashboard" }).click();

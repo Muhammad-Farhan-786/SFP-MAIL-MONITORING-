@@ -23,3 +23,6 @@ The machine-readable OpenAPI 3.1 reference is available at `/openapi.json` throu
 | GET /api/health | Database connectivity health | Public, no sensitive configuration |
 
 For writes after login, echo the readable `csrf` cookie into `X-CSRF-Token`; the server binds it to the signed HttpOnly session. Never send session or API secrets through URLs. History ranges accept 1, 7, 30, or 90 days. The schema supplies field-level constraints and request/response details. Provider/SMTP credentials are environment-only; encrypted seed credentials are accepted once and never returned.
+
+
+Upgrade endpoints: GET `/api/alerts/{domain_id}` returns delivery history (administrator settings only); PUT `/api/alerts/{domain_id}/settings` persists enable/pause/recipients/reminder/critical-only policy; POST `/api/alerts/{domain_id}/test` queues an explicitly requested notification test. Writes require admin + CSRF. All endpoints also work behind `/email-monitoring/`. Overview includes `scans`, measurement `availability`, and score `reduction` per factor. Seed creation accepts protected OAuth fields, never returns credential values, and rejects Outlook basic authentication.

@@ -34,3 +34,17 @@ describe("API boundary", () => {
     );
   });
 });
+
+describe("deployment prefix", () => {
+  it("retains the email-monitoring API prefix", async () => {
+    window.history.pushState({}, "", "/email-monitoring/");
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: () => Promise.resolve({}) });
+    vi.stubGlobal("fetch", fetcher);
+    await api("/auth/me");
+    expect(fetcher.mock.calls[0][0]).toBe("/email-monitoring/api/auth/me");
+    window.history.pushState({}, "", "/");
+    vi.unstubAllGlobals();
+  });
+});

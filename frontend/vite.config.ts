@@ -2,6 +2,7 @@ import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import { existsSync } from "node:fs";
 export default defineConfig({
+  base: "/email-monitoring/",
   plugins: [react()],
   define: {
     "import.meta.env.VITE_LOGO_AVAILABLE": JSON.stringify(
@@ -22,7 +23,15 @@ export default defineConfig({
       },
     },
   },
-  server: { proxy: { "/api": "http://127.0.0.1:8000" } },
+  server: {
+    proxy: {
+      "/email-monitoring/api": {
+        target: "http://127.0.0.1:8000",
+        rewrite: (path: string) => path.replace("/email-monitoring", ""),
+      },
+      "/api": "http://127.0.0.1:8000",
+    },
+  },
   test: {
     exclude: ["e2e/**", "node_modules/**"],
     environment: "jsdom",

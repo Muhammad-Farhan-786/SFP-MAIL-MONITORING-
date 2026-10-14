@@ -1,7 +1,7 @@
 import ipaddress, re
 from datetime import datetime, timezone, timedelta
 from typing import Literal
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 
 def hostname(value):
@@ -64,6 +64,8 @@ class SettingsInput(BaseModel):
     @classmethod
     def intervals_valid(cls, values):
         expected = {"auth", "smtp", "reputation", "blacklist", "placement", "reports"}
+        if "delivery" in values:
+            expected.add("delivery")
         if set(values) != expected or any(
             not 300 <= v <= 86400 * 30 for v in values.values()
         ):
@@ -77,8 +79,33 @@ class SeedInput(BaseModel):
     imap_host: str
     inbox_folder: str = Field(default="INBOX", max_length=100, pattern=r'^[^\r\n"]+$')
     spam_folder: str = Field(max_length=100, pattern=r'^[^\r\n"]+$')
-    password: str = Field(min_length=1, max_length=512)
+    auth_method: Literal["password", "oauth2"] = "password"
+    password: str = Field(default="", max_length=512)
+    oauth_client_id: str = Field(default="", max_length=200)
+    oauth_client_secret: str = Field(default="", max_length=2000)
+    oauth_refresh_token: str = Field(default="", max_length=10000)
+    oauth_tenant: str = Field(
+        default="common", pattern=r"^(common|organizations|[0-9a-fA-F-]{36})$"
+    )
     _host = field_validator("imap_host")(hostname)
+
+    @model_validator(mode="after")
+    def credentials(self):
+        if self.provider == "Outlook" and self.auth_method != "oauth2":
+            raise ValueError(
+                "Outlook requires provider-approved OAuth2, not basic IMAP authentication"
+            )
+        if self.auth_method == "password" and not self.password:
+            raise ValueError("An authorized app password is required")
+        if self.auth_method == "oauth2" and (
+            self.provider not in ("Gmail", "Outlook")
+            or not self.oauth_client_id
+            or not self.oauth_refresh_token
+        ):
+            raise ValueError(
+                "OAuth requires a Gmail/Outlook client ID and authorized refresh token"
+            )
+        return self
 
 
 class IssueUpdate(BaseModel):
@@ -98,6 +125,8 @@ class DeliveryInput(BaseModel):
         "hard_bounce",
         "soft_bounce",
         "rejected",
+        "deferred",
+        "complaint",
     ]
     smtp_code: str | None = Field(default=None, max_length=20, pattern=r"^[0-9. ]+$")
     reason: str | None = Field(default=None, max_length=2000)
@@ -122,3 +151,16 @@ class UserInput(BaseModel):
     email: EmailStr
     password: str = Field(min_length=12, max_length=512)
     role: Literal["admin", "viewer"] = "viewer"
+
+
+class AlertSettingsInput(BaseModel):
+    enabled: bool
+    paused: bool
+    recipients: list[EmailStr] = Field(max_length=20)
+    reminder_seconds: int = Field(default=300, ge=300, le=86400)
+    critical_only: bool = False
+
+    @field_validator("recipients")
+    @classmethod
+    def unique(cls, values):
+        return list(dict.fromkeys(values))

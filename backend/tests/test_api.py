@@ -75,7 +75,11 @@ def test_secrets_not_returned(signed, db):
         "password": "test-app-password",
     }
     r = signed.post("/api/seeds/1", json=data)
-    assert r.status_code == 200 and "password" not in r.text
+    assert (
+        r.status_code == 200
+        and "password" not in r.json()
+        and "test-app-password" not in r.text
+    )
     assert db.scalar(select(SeedMailbox)).encrypted_password != "test-app-password"
 
 

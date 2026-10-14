@@ -54,6 +54,8 @@ import {
   Monitoring,
 } from "./api";
 import "./style.css";
+import AlertSettings from "./AlertSettings";
+import ScanStatus from "./ScanStatus";
 const navigation = [
   ["Overview", LayoutDashboard],
   ["Authentication", ShieldCheck],
@@ -72,7 +74,7 @@ function Brand() {
     <div className="brand">
       {!missing && (
         <img
-          src="/branding/newhotmusic-logo.png"
+          src={import.meta.env.BASE_URL + "branding/newhotmusic-logo.png"}
           alt="NewHotMusic official logo"
           onError={() => setMissing(true)}
         />
@@ -332,6 +334,9 @@ function CheckCard({ card, onClick }: { card: Card; onClick: () => void }) {
       </div>
       <h3>{card.category}</h3>
       <Badge state={card.state} />
+      {card.availability && card.availability !== "Measured" && (
+        <small>{card.availability}</small>
+      )}
       <small>
         {card.checked_at
           ? "Checked " + new Date(card.checked_at).toLocaleDateString()
@@ -358,9 +363,11 @@ function Score({
             ? "Let’s check your email health."
             : overview.state === "Critical"
               ? "Your email needs attention."
-              : overview.state === "Needs Attention"
+              : overview.state === "Warning"
                 ? "A few signals need attention."
-                : "Your email is in good hands."}
+                : overview.provisional
+                  ? "Measured signals look healthy."
+                  : "Your email is in good hands."}
         </h2>
         <p>{overview.summary}</p>
         <div className="hero-tags">
@@ -425,6 +432,7 @@ function App() {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [domain, setDomain] = useState(0);
   const [overview, setOverview] = useState<Overview | null>(null);
+  const [historyTruncated, setHistoryTruncated] = useState(false);
   const [series, setSeries] = useState<Series[]>([]);
   const [checks, setChecks] = useState<Card[]>([]);
   const [issues, setIssues] = useState<Issue[]>([]);
@@ -480,7 +488,7 @@ function App() {
     try {
       const [o, h, i, a] = await Promise.all([
         api<Overview>(`/overview/${domain}?days=${days}`),
-        api<{ series: Series[]; checks: Card[] }>(
+        api<{ series: Series[]; checks: Card[]; truncated: boolean }>(
           `/history/${domain}?days=${days}`,
         ),
         api<Issue[]>(`/issues/${domain}`),
@@ -489,6 +497,7 @@ function App() {
       setOverview(o);
       setSeries(h.series);
       setChecks(h.checks);
+      setHistoryTruncated(h.truncated);
       setIssues(i);
       setActivity(a);
       setError("");
@@ -565,6 +574,7 @@ function App() {
           {navigation.map(([name, Icon]) => (
             <button
               key={name}
+              aria-label={name}
               className={page === name ? "nav-link active" : "nav-link"}
               onClick={() => {
                 setPage(name);
@@ -686,6 +696,13 @@ function App() {
               )}
             </div>
           </div>
+          {historyTruncated && (
+            <div className="banner">
+              History shows the most recent recorded samples. Shorten the date
+              range for complete chart coverage.
+            </div>
+          )}
+
           {error && (
             <div className="banner error" role="alert">
               <AlertCircle size={16} />
@@ -1067,7 +1084,11 @@ function App() {
                                       <Badge state={p.state} />
                                     </td>
                                     <td>{when(p.created_at)}</td>
-                                    <td>{p.detail}</td>
+                                    <td>
+                                      {p.detail}
+                                      <br />
+                                      <small>{p.sender_scope}</small>
+                                    </td>
                                   </tr>
                                 ))}
                               </tbody>
@@ -1406,7 +1427,7 @@ function App() {
                 <th>Signal</th>
                 <th>Weight</th>
                 <th>Status</th>
-                <th>Earned</th>
+                <th>Points reducing score</th>
               </tr>
             </thead>
             <tbody>
@@ -1417,7 +1438,11 @@ function App() {
                   <td>
                     <Badge state={f.state} />
                   </td>
-                  <td>{f.earned ?? "Unmeasured"}</td>
+                  <td>
+                    {f.reduction == null
+                      ? "Unmeasured"
+                      : f.reduction.toFixed(1)}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -1446,6 +1471,23 @@ function App() {
           <p>{selectedIssue.impact}</p>
           <h3>Recommended action</h3>
           <p>{selectedIssue.action}</p>
+          {selectedIssue.diagnosis?.likely_cause && (
+            <>
+              <h3>Likely root cause</h3>
+              <p>{selectedIssue.diagnosis.likely_cause}</p>
+              <h3>Required access</h3>
+              <p>{selectedIssue.diagnosis.required_access}</p>
+              <h3>Verification instructions</h3>
+              <p>{selectedIssue.diagnosis.verification}</p>
+            </>
+          )}
+          <p className="subtle">
+            Detected: {when(selectedIssue.detected_at)} · Last observed:{" "}
+            {when(selectedIssue.last_seen)} · Current observation:{" "}
+            {selectedIssue.observed_state || "Unknown"}
+            {selectedIssue.recovered_at &&
+              ` · Recovery observed: ${when(selectedIssue.recovered_at)}`}
+          </p>
           <details>
             <summary>Technical details</summary>
             <p>{selectedIssue.technical}</p>
@@ -1662,6 +1704,8 @@ function SettingsPage({
   save: (fn: () => Promise<unknown>, msg: string) => void;
   domainId: number;
 }) {
+  const [seedAuth, setSeedAuth] = useState("password");
+  const [seedProvider, setSeedProvider] = useState("Gmail");
   const [monitoring, setMonitoring] = useState<Monitoring>(settings.monitoring);
   const [domainName, setDomainName] = useState(settings.domain.name);
   const [selectors, setSelectors] = useState(
@@ -1689,6 +1733,7 @@ function SettingsPage({
   }
   return (
     <div className="settings-grid">
+      <AlertSettings domainId={domainId} busy={busy} save={save} />
       <section className="panel settings-panel">
         <h3>Domain & sending infrastructure</h3>
         <p>Monitor the domain and IP addresses you control.</p>
@@ -1839,7 +1884,14 @@ function SettingsPage({
         <form onSubmit={seed}>
           <label>
             Provider
-            <select name="provider">
+            <select
+              name="provider"
+              value={seedProvider}
+              onChange={(e) => {
+                setSeedProvider(e.target.value);
+                if (e.target.value === "Outlook") setSeedAuth("oauth2");
+              }}
+            >
               <option>Gmail</option>
               <option>Outlook</option>
               <option>IMAP</option>
@@ -1866,17 +1918,66 @@ function SettingsPage({
             />
           </label>
           <label>
-            App password
-            <input
-              name="password"
-              type="password"
-              autoComplete="new-password"
-              required
-            />
+            Authentication method
+            <select
+              name="auth_method"
+              value={seedAuth}
+              onChange={(e) => setSeedAuth(e.target.value)}
+            >
+              <option value="password" disabled={seedProvider === "Outlook"}>
+                Authorized app password
+              </option>
+              <option value="oauth2" disabled={seedProvider === "IMAP"}>
+                Provider-approved OAuth2
+              </option>
+            </select>
           </label>
+          {seedAuth === "password" ? (
+            <label>
+              App password
+              <input
+                name="password"
+                type="password"
+                autoComplete="new-password"
+                required
+              />
+            </label>
+          ) : (
+            <>
+              <label>
+                OAuth client ID
+                <input name="oauth_client_id" required autoComplete="off" />
+              </label>
+              <label>
+                OAuth client secret (where required)
+                <input
+                  name="oauth_client_secret"
+                  type="password"
+                  autoComplete="new-password"
+                />
+              </label>
+              <label>
+                Authorized OAuth refresh token
+                <input
+                  name="oauth_refresh_token"
+                  type="password"
+                  required
+                  autoComplete="new-password"
+                />
+              </label>
+              {seedProvider === "Outlook" && (
+                <label>
+                  Microsoft tenant
+                  <input name="oauth_tenant" defaultValue="common" required />
+                </label>
+              )}
+            </>
+          )}
           <p className="subtle">
-            Encrypted at rest. Providers requiring OAuth need an OAuth adapter;
-            ordinary passwords may not be accepted.
+            Credentials are encrypted and never returned. Obtain
+            provider-approved mailbox consent first. Outlook requires OAuth.
+            Seed SMTP scope is separate from notification delivery and does not
+            automatically represent production sending.
           </p>
           <button className="primary" disabled={busy}>
             Add authorized mailbox

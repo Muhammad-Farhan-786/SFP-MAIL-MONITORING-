@@ -2,6 +2,10 @@
 
 A self-hosted email monitoring workspace for NewHotMusic.com. The responsive executive dashboard explains health, delivery, inbox placement, reputation, open issues, and verified fixes. Technical evidence is available through drill-downs. Unconfigured sources and unknown results stay visible; production never substitutes demo measurements.
 
+## Automated monitoring upgrade
+
+Public DNS and SMTP checks now default to five minutes. Persistent scan status, evidence-based diagnostics, grouped recurring/recovery email alerts, pause/resume controls, OAuth seed mailboxes, and signed delivery events are integrated into the existing dashboard. Both root routes and `/email-monitoring/` deployment paths work. See [upgrade/deployment instructions](docs/UPGRADE.md) for additive migration 002, exact operator commands, credential requirements, verification, and rollback. No live VPS deployment or automatic remediation is performed.
+
 ## Included
 
 FastAPI + PostgreSQL, React + TypeScript, Celery + Redis, and Nginx deployed through Docker Compose. Authentication/DNS monitoring, inbound SMTP/TLS probes, signed delivery/bounce ingestion, authorized IMAP seed placement, modular reputation/DNSBL integrations, deduplicated issues and email alerts, configurable schedules, transparent scoring, historical charts, daily/weekly reports, audit logs, migrations, and backup/restore tooling.

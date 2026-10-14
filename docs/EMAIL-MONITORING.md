@@ -29,7 +29,7 @@ Supported kinds: delivered, temporary_failure, permanent_failure, hard_bounce, s
 
 ## Placement
 
-Configure an SMTP sender and authorized test mailboxes in Settings. Credentials are encrypted with Fernet; never returned through the API. Enable IMAP on the mailbox and configure the exact Inbox and Spam/Junk folders. Gmail commonly supports an app password with 2-step verification; Outlook organization policy may require OAuth and a tenant-specific adapter. The included IMAP adapter works where authorized password/app-password IMAP is supported.
+Configure an SMTP sender and authorized test mailboxes in Settings. Credentials are encrypted with Fernet; never returned through the API. Enable IMAP on the mailbox and configure the exact Inbox and Spam/Junk folders. Gmail commonly supports an app password with 2-step verification; Outlook organization policy may require the implemented OAuth2 adapter and approved tenant consent. The included IMAP adapter works where authorized password/app-password IMAP is supported.
 
 The worker sends a unique controlled subject to each seed, waits 120 seconds, then searches folders read-only. A missing message remains Pending until the 900-second delivery window ends. Results are Inbox, Spam, Missing, or Unknown. Authentication/connection errors never become Inbox. Extend `PROVIDERS` to add OAuth or provider API support.
 
@@ -41,6 +41,9 @@ DNSBL sources are disabled by default. Supply only zones whose operator licenses
 
 ## Score
 
-Weights: SPF 12, DKIM 12, DMARC 12, MX 6, SMTP 8, TLS 8, Delivery 10, Bounce 8, Blacklist 8, IP reputation 5, Domain reputation 3, Placement 8 (sum 110). Healthy earns 100% weight; Warning 50%; Critical 0. Unknown/Not Configured/Never Checked are excluded from the measured denominator. Score = round(100 × earned / measured weight) − min(20, 5 × active unverified critical issues), clamped at zero. Without measured weight the score is null. Coverage always displays measured weight / 110; partial scores are labeled provisional. Measurements older than twice their schedule are stale and excluded. A provisional 100 is not complete health assurance.
+Weights: SPF 12, DKIM 12, DMARC 12, MX 6, SMTP 8, TLS 8, Delivery 10, Bounce 8, Blacklist 8, IP reputation 5, Domain reputation 3, Placement 8 (plus PTR 4; sum 114). Healthy earns 100% weight; Warning 50%; Critical 0. Unknown/Not Configured/Never Checked are excluded from the measured denominator. Score = round(100 × earned / measured weight) − min(20, 5 × active unverified critical issues), clamped at zero. Without measured weight the score is null. Coverage always displays measured weight / 114; partial scores are labeled provisional. Measurements older than twice their schedule are stale and excluded. A provisional 100 is not complete health assurance.
 
 Excellent defaults to 95+, Healthy 80+, Needs Attention 50+, Critical below 50. Thresholds are editable. Fix a signal, then complete the real retest workflow. Daily/weekly reports retain the snapshot, rates, new/resolved issues, and verified fixes. Email summaries require configured SMTP and alert recipients.
+
+
+This release adds deferred/complaint events, sender scope, five-minute public scans, persisted diagnostic alert policies, and Gmail/Outlook OAuth2. See UPGRADE.md for the authoritative current configuration and provider adapter contract.

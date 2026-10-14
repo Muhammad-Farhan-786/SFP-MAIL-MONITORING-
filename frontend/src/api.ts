@@ -4,11 +4,13 @@ export type State =
   | "Critical"
   | "Unknown"
   | "Never Checked"
-  | "Not Configured";
+  | "Not Configured"
+  | "Not Measured";
 export interface Card {
   category: string;
   state: State;
   summary: string;
+  availability?: string;
   checked_at: string | null;
   evidence: Record<string, unknown>;
 }
@@ -37,11 +39,14 @@ export interface Overview {
     state: string;
     created_at: string;
     detail: string;
+    sender_scope: string;
   }[];
+  scans: Scan[];
   factors: {
     category: string;
     weight: number;
     earned: number | null;
+    reduction: number | null;
     state: string;
   }[];
 }
@@ -61,6 +66,14 @@ export interface Issue {
   verified_by: string | null;
   verified_at: string | null;
   retest_result: string | null;
+  diagnosis: {
+    likely_cause: string;
+    required_access: string;
+    solution_steps: string[];
+    verification: string;
+  };
+  observed_state: string | null;
+  recovered_at: string | null;
   evidence: Record<string, unknown>;
 }
 export interface Series {
@@ -89,6 +102,7 @@ export interface Monitoring {
   health_excellent: number;
 }
 export interface Settings {
+  alerts: AlertPolicy;
   monitoring: Monitoring;
   domain: Domain;
   sending_ips: string[];
@@ -111,7 +125,10 @@ export async function api<T>(
       .split("; ")
       .find((v) => v.startsWith("csrf="))
       ?.split("=")[1] || "";
-  const response = await fetch("/api" + path, {
+  const prefix = window.location.pathname.startsWith("/email-monitoring")
+    ? "/email-monitoring"
+    : "";
+  const response = await fetch(prefix + "/api" + path, {
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -139,4 +156,37 @@ export function percent(value: number | null | undefined) {
 }
 export function when(value: string | null | undefined) {
   return value ? new Date(value).toLocaleString() : "Never checked";
+}
+
+export interface Scan {
+  interval_seconds: number;
+  group: string;
+  state: string;
+  last_success_at: string | null;
+  next_due_at: string | null;
+  duration_seconds: number | null;
+  finished_at?: string | null;
+  error?: string | null;
+}
+export interface AlertPolicy {
+  enabled: boolean;
+  paused: boolean;
+  recipients: string[];
+  reminder_seconds: number;
+  critical_only: boolean;
+}
+export interface AlertStatus {
+  settings?: AlertPolicy;
+  last_sent: string | null;
+  last_delivery_status: string;
+  history: {
+    id: number;
+    kind: string;
+    state: string;
+    created_at: string;
+    sent_at: string | null;
+    attempts: number;
+    error: string | null;
+    suppression_reason: string | null;
+  }[];
 }

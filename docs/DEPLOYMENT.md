@@ -46,3 +46,6 @@ Use a fresh disposable Compose project/database, set DEMO_MODE=true before start
 To reset an administrator password from an interactive trusted VPS terminal, run `docker compose exec backend python -m app.password`. The helper prompts without echoing the password. Rotate JWT_SECRET/restart services if immediate session invalidation is required.
 
 For PostgreSQL integration tests, create a dedicated database named `emailhealth_tests` with the test application's database role and set TEST_DATABASE_URL to that database while running pytest. The fixture rejects database names without the `_tests` suffix and resets the test schema between cases. Never point this fixture at a live application database.
+
+
+For this release use [the in-place five-minute upgrade guide](UPGRADE.md). It supersedes earlier default auth/SMTP schedules and the earlier Outlook app-password limitation: Outlook now requires the implemented OAuth2 adapter. Notification policy is persisted per domain in the dashboard. Existing root URLs remain supported alongside /email-monitoring/.

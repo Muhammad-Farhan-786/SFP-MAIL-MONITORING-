@@ -34,3 +34,18 @@ Backend tests emit a Starlette/httpx TestClient deprecation warning; tests execu
 * Production hostname/certificates and HTTPS were not supplied. The HTTPS-ready template is included but a valid public TLS deployment has not been verified.
 
 Do not call this instance a fully configured production email monitoring service until these external operations are configured and verified. No fake data are presented as real monitoring measurements.
+
+## Upgrade validation — 2026-10-14
+
+This release was validated in the existing cloud development environment; **no live VPS was deployed or restarted**. Additive Alembic revision 002 applied successfully over revision 001. All 22,833 monitoring records present when local workers were paused and the existing user remained after migration. PostgreSQL and Redis volumes were retained; the local database was backed up first.
+
+The current checkout suite includes the original tests and new coverage for five-minute schedule defaults, persistent leases, redelivery/expiry, broker failures, diagnostic guidance/evidence, grouped reminders at 300 seconds, deduplication, critical-only policies, pause/disable/resume suppression, recovery notices, preserved closure verification, bounded SMTP retries, partial SMTP acceptance, fresh policy reads across sessions, missing/stale measurements, Outlook OAuth requirements, token refresh/encryption, disabled seed accounts, webhook replay/conflicts/new event kinds, provider event normalization, malformed signature-header rejection, and newest-sample history caps.
+
+* Backend: 72 tests executed on isolated SQLite and on a dedicated PostgreSQL `*_tests` database; all passed, no skips. Tests reset only the disposable test schema, never the application database.
+* Frontend: 7 unit tests passed, including alert controls/recipient editing and prefixed API requests; TypeScript and Vite production build passed.
+* Chromium: 2 desktop/mobile tests passed at root and the same 2 passed at `/email-monitoring/`; navigation/login/score details/console and overflow checks passed.
+* All application Docker images built using the supplied verified cloud proxy/CA. Compose configuration validation and app Nginx syntax validation passed.
+* Worker ping and scheduler heartbeat passed. Persisted real job metadata shows auth/SMTP/delivery reservations at 300 seconds, reputation/blacklist at 43200 seconds, placement/reports at 86400 seconds. Native DNS reachability remains inconclusive in this cloud; the UI records Degraded/Unknown instead of healthy claims.
+* Signed delivery/OAuth/SMTP/IMAP tests use controlled fixtures. No live notification relay, production provider event stream, OAuth account, or seed inbox receipt was configured or claimed as verified. The existing Starlette TestClient deprecation warning remains non-failing.
+
+See [UPGRADE.md](UPGRADE.md) for exact migration/rebuild/restart/verification/rollback commands, required SMTP/OAuth/provider configuration, and the boundary between a notification-relay test and production-sender placement. Database histories and suppression records remain auditable. SMTP acceptance is not proof of recipient inbox delivery; exactly-once SMTP across process/network failures requires receiver cooperation.

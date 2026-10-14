@@ -8,6 +8,7 @@ from sqlalchemy import (
     Float,
     Boolean,
     UniqueConstraint,
+    Index,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
@@ -43,6 +44,9 @@ class SendingIP(Base):
 
 class Check(Base):
     __tablename__ = "monitoring_checks"
+    __table_args__ = (
+        Index("ix_checks_domain_category_time", "domain_id", "category", "checked_at"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     domain_id: Mapped[int] = mapped_column(ForeignKey("domains.id"), index=True)
     category: Mapped[str] = mapped_column(String(50), index=True)
@@ -87,6 +91,7 @@ class DeliveryEvent(Base):
     __tablename__ = "delivery_events"
     id: Mapped[int] = mapped_column(primary_key=True)
     event_id: Mapped[str] = mapped_column(String(200), unique=True)
+    payload_hash: Mapped[str | None] = mapped_column(String(64))
     domain_id: Mapped[int] = mapped_column(ForeignKey("domains.id"), index=True)
     message_id: Mapped[str | None] = mapped_column(String(250))
     recipient_domain: Mapped[str] = mapped_column(String(253))
@@ -119,6 +124,9 @@ class SeedMailbox(Base):
     inbox_folder: Mapped[str] = mapped_column(String(100), default="INBOX")
     spam_folder: Mapped[str] = mapped_column(String(100), default="[Gmail]/Spam")
     encrypted_password: Mapped[str] = mapped_column(Text)
+    auth_method: Mapped[str] = mapped_column(
+        String(20), default="password", server_default="password"
+    )
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -128,6 +136,11 @@ class PlacementTest(Base):
     domain_id: Mapped[int] = mapped_column(ForeignKey("domains.id"))
     seed_id: Mapped[int] = mapped_column(ForeignKey("seed_mailboxes.id"))
     token: Mapped[str] = mapped_column(String(100), unique=True)
+    sender_scope: Mapped[str] = mapped_column(
+        Text,
+        default="Monitoring SMTP; not production sending infrastructure",
+        server_default="Monitoring SMTP; not production sending infrastructure",
+    )
     state: Mapped[str] = mapped_column(String(30), default="Pending")
     detail: Mapped[str] = mapped_column(Text, default="Waiting for delivery")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -169,6 +182,9 @@ class Issue(Base):
     action: Mapped[str] = mapped_column(Text)
     impact: Mapped[str] = mapped_column(Text)
     evidence: Mapped[dict] = mapped_column(JSON)
+    diagnosis: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
+    observed_state: Mapped[str | None] = mapped_column(String(30))
+    recovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     owner: Mapped[str | None] = mapped_column(String(254))
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -192,6 +208,16 @@ class Alert(Base):
     __tablename__ = "alerts"
     id: Mapped[int] = mapped_column(primary_key=True)
     issue_id: Mapped[int | None] = mapped_column(ForeignKey("issues.id"))
+    domain_id: Mapped[int | None] = mapped_column(ForeignKey("domains.id"), index=True)
+    dedup_key: Mapped[str | None] = mapped_column(String(200), unique=True)
+    kind: Mapped[str] = mapped_column(
+        String(30), default="Legacy", server_default="Legacy"
+    )
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    suppression_reason: Mapped[str | None] = mapped_column(Text)
     channel: Mapped[str] = mapped_column(String(30), default="email")
     state: Mapped[str] = mapped_column(String(30), default="Pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -226,3 +252,25 @@ class Setting(Base):
     __tablename__ = "system_settings"
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[dict] = mapped_column(JSON)
+
+
+class ScanJob(Base):
+    """Persistent scheduling lease and last-result metadata; existing check history is retained."""
+
+    __tablename__ = "scan_jobs"
+    __table_args__ = (UniqueConstraint("domain_id", "group"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    domain_id: Mapped[int] = mapped_column(ForeignKey("domains.id"), index=True)
+    group: Mapped[str] = mapped_column(String(30))
+    state: Mapped[str] = mapped_column(String(30), default="Never Checked")
+    task_id: Mapped[str | None] = mapped_column(String(100))
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_due_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_seconds: Mapped[float | None] = mapped_column(Float)
+    error: Mapped[str | None] = mapped_column(Text)

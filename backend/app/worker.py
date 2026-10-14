@@ -7,6 +7,8 @@ from .db import Session, engine
 from .models import *
 from .services import *
 from . import mail
+from . import scheduling
+from .alerts import enqueue_digest, send_outbox
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("email-health")
@@ -23,50 +25,129 @@ celery.conf.update(
     worker_prefetch_multiplier=1,
     broker_connection_retry_on_startup=True,
     beat_schedule={
-        "dispatch": {"task": "app.worker.dispatch", "schedule": 60.0},
-        "alerts": {"task": "app.worker.deliver_alerts", "schedule": 60.0},
+        "dispatch": {
+            "task": "app.worker.dispatch",
+            "schedule": 30.0,
+            "options": {"expires": 25},
+        },
+        "alerts": {
+            "task": "app.worker.deliver_alerts",
+            "schedule": 30.0,
+            "options": {"expires": 25},
+        },
     },
 )
 
 
 @celery.task
-def monitor(domain_id, group):
+def monitor(domain_id, group, token=None):
     with engine.connect() as lock, Session() as db:
-        if not lock.scalar(
-            text("SELECT pg_try_advisory_lock(:key)"),
-            {"key": domain_id * 100 + list(INTERVALS).index(group)},
-        ):
+        key = domain_id * 100 + list(INTERVALS).index(group)
+        if not lock.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": key}):
             return
+        job = None
         try:
             if config().demo_mode:
                 return
             domain = db.get(Domain, domain_id)
             if not domain or not domain.active:
                 return
+            if token:
+                job = scheduling.start(db, domain_id, group, token)
+                if not job:
+                    return
+            else:
+                job = scheduling.reserve(db, domain_id, group, manual=True)
+                if not job:
+                    return
+                db.commit()
+                job = scheduling.start(db, domain_id, group, job.task_id)
             if group == "placement":
-                for ident in mail.start_placement(db, domain_id):
+                pending = mail.start_placement(db, domain_id)
+                for ident in pending:
                     collect_placement.apply_async(
                         args=[ident], countdown=config().seed_wait_seconds
                     )
+                if pending:
+                    job.state = "Waiting"
+                    job.lease_until = now() + timedelta(
+                        seconds=config().seed_missing_after_seconds + 300
+                    )
+                    db.commit()
+                    finish_placement_scan.apply_async(
+                        args=[job.id, job.task_id, pending],
+                        countdown=config().seed_missing_after_seconds + 30,
+                    )
+                    return
+                mail.placement_summary(db, domain_id)
             elif group == "reports":
                 generate_reports(db, domain)
+            elif group == "delivery":
+                evaluate_delivery(db, domain_id)
             else:
                 execute_group(db, domain, group)
+            categories = [c for c, g in CATEGORY_GROUP.items() if g == group]
+            values = [
+                c.state
+                for name, c in latest_checks(db, domain_id).items()
+                if name in categories
+            ]
+            state = (
+                "Not Configured"
+                if values
+                and all(v in ("Not Configured", "Not Measured") for v in values)
+                else "Degraded"
+                if any(v == "Unknown" for v in values)
+                else "Completed"
+            )
+            scheduling.finish(db, job, state)
             logger.info(
                 json.dumps(
                     {
                         "event": "monitor_complete",
                         "domain_id": domain_id,
                         "group": group,
+                        "state": state,
+                        "duration_seconds": job.duration_seconds,
+                    }
+                )
+            )
+        except Exception as exc:
+            db.rollback()
+            if job:
+                scheduling.finish(
+                    db, db.get(ScanJob, job.id), "Failed", type(exc).__name__
+                )
+            logger.error(
+                json.dumps(
+                    {
+                        "event": "monitor_failed",
+                        "domain_id": domain_id,
+                        "group": group,
+                        "error": type(exc).__name__,
                     }
                 )
             )
         finally:
-            lock.execute(
-                text("SELECT pg_advisory_unlock(:key)"),
-                {"key": domain_id * 100 + list(INTERVALS).index(group)},
-            )
-            db.commit()
+            lock.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+            lock.commit()
+
+
+@celery.task
+def finish_placement_scan(job_id, token, ids):
+    with Session() as db:
+        job = db.scalar(select(ScanJob).where(ScanJob.id == job_id).with_for_update())
+        if not job or job.task_id != token or job.state != "Waiting":
+            return
+        for ident in ids:
+            test = db.get(PlacementTest, ident)
+            if test and test.state == "Pending":
+                mail.finish_placement(db, test)
+        mail.placement_summary(db, job.domain_id)
+        latest = latest_checks(db, job.domain_id).get("Inbox Placement")
+        scheduling.finish(
+            db, job, "Degraded" if latest and latest.state == "Unknown" else "Completed"
+        )
 
 
 @celery.task
@@ -82,12 +163,57 @@ def collect_placement(test_id):
 
 @celery.task
 def retest(issue_id, actor):
-    with Session() as db:
+    with engine.connect() as lock, Session() as db:
         issue = db.scalar(select(Issue).where(Issue.id == issue_id).with_for_update())
         if not issue or issue.status != "Retesting":
             return
         domain = db.get(Domain, issue.domain_id)
         group = CATEGORY_GROUP.get(issue.category)
+        active = db.scalar(
+            select(ScanJob).where(
+                ScanJob.domain_id == issue.domain_id, ScanJob.group == group
+            )
+        )
+        if (
+            active
+            and active.state in scheduling.BUSY
+            and active.lease_until
+            and aware(active.lease_until) > now()
+        ):
+            issue.status = "Ready for Retest"
+            issue.retest_result = "A category scan is already queued or running; retry after it completes."
+            db.add(
+                IssueHistory(
+                    issue_id=issue_id,
+                    status=issue.status,
+                    actor=actor,
+                    note=issue.retest_result,
+                )
+            )
+            db.commit()
+            return
+        key = (
+            issue.domain_id * 100 + list(INTERVALS).index(group)
+            if group in INTERVALS
+            else None
+        )
+        if key is None or not lock.scalar(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": key}
+        ):
+            issue.status = "Ready for Retest"
+            issue.retest_result = (
+                "A category scan is already running; retry after it completes."
+            )
+            db.add(
+                IssueHistory(
+                    issue_id=issue_id,
+                    status=issue.status,
+                    actor=actor,
+                    note=issue.retest_result,
+                )
+            )
+            db.commit()
+            return
         try:
             if group == "delivery":
                 evaluate_delivery(db, domain.id)
@@ -123,6 +249,9 @@ def retest(issue_id, actor):
                 )
             )
             db.commit()
+        finally:
+            lock.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+            lock.commit()
 
 
 @celery.task
@@ -159,7 +288,7 @@ def evaluate_delivery(db, domain_id):
         ("Delivery Rate", stats["failure_rate"], prefs["failure_threshold"]),
     ]:
         state = (
-            "Unknown"
+            ("Not Measured" if config().delivery_webhook_secret else "Not Configured")
             if value is None
             else "Critical"
             if value > limit * 2
@@ -173,7 +302,7 @@ def evaluate_delivery(db, domain_id):
             category,
             {
                 "state": state,
-                "summary": "No delivery events received."
+                "summary": "Delivery provider telemetry is Not Measured; no events received."
                 if value is None
                 else "Delivery telemetry evaluated over the past 24 hours.",
                 "evidence": stats,
@@ -222,19 +351,22 @@ def generate_reports(db, domain):
             )
         )
         db.commit()
-        recipients = [
-            a.strip() for a in config().alert_recipients.split(",") if a.strip()
-        ]
-        try:
-            mail.send(
-                f"NewHotMusic {period} email health summary",
-                f"Health: {content['state']}\nScore: {content['score']}\nCoverage: {content['coverage']}%\n{content['summary']}\nOpen issues: {content['issues']['open']}\nDelivery: {content['delivery']}",
-                recipients,
+        key = f"summary:{domain.id}:{period}:{start.isoformat()}"
+        if not db.scalar(select(Alert.id).where(Alert.dedup_key == key)):
+            db.add(
+                Alert(
+                    domain_id=domain.id,
+                    kind="Summary",
+                    dedup_key=key,
+                    next_attempt_at=now(),
+                    payload={
+                        "critical": False,
+                        "subject": f"NewHotMusic {period} email health summary",
+                        "body": f"Health: {content['state']}\nScore: {content['score']} (provisional: {content['provisional']})\nCoverage: {content['coverage']}%\n{content['summary']}\nOpen issues: {content['issues']['open']}\nDelivery: {content['delivery']}",
+                    },
+                )
             )
-        except Exception:
-            logger.warning(
-                json.dumps({"event": "summary_email_failed", "period": period})
-            )
+            db.commit()
 
 
 @celery.task
@@ -245,24 +377,24 @@ def dispatch():
         try:
             if config().demo_mode:
                 return
-            cfg = preferences(db)
             for domain in db.scalars(select(Domain).where(Domain.active.is_(True))):
-                for group, interval in cfg["intervals"].items():
-                    key = f"last_dispatch:{domain.id}:{group}"
-                    stamp = db.get(Setting, key)
+                for group in preferences(db)["intervals"]:
+                    job = db.scalar(
+                        select(ScanJob).where(
+                            ScanJob.domain_id == domain.id, ScanJob.group == group
+                        )
+                    )
                     if (
-                        not stamp
-                        or (
-                            now() - datetime.fromisoformat(stamp.value["at"])
-                        ).total_seconds()
-                        >= interval
+                        job
+                        and job.state == "Pending"
+                        and job.lease_until
+                        and aware(job.lease_until) > now()
                     ):
-                        monitor.delay(domain.id, group)
-                        if stamp:
-                            stamp.value = {"at": now().isoformat()}
-                        else:
-                            db.add(Setting(key=key, value={"at": now().isoformat()}))
-                evaluate_delivery(db, domain.id)
+                        scheduling.publish(db, job, monitor)
+                        continue
+                    job = scheduling.reserve(db, domain.id, group)
+                    if job:
+                        scheduling.publish(db, job, monitor)
             heartbeat = db.get(Setting, "scheduler_heartbeat")
             if heartbeat:
                 heartbeat.value = {"at": now().isoformat()}
@@ -278,39 +410,18 @@ def dispatch():
 
 @celery.task
 def deliver_alerts():
-    with Session() as db:
-        for alert in db.scalars(
-            select(Alert)
-            .where(Alert.state.in_(["Pending", "Not Configured", "Retrying"]))
-            .order_by(Alert.id)
-            .with_for_update(skip_locked=True)
-            .limit(50)
-        ):
-            issue = db.get(Issue, alert.issue_id)
-            if not issue or issue.status in ("Closed", "Verified"):
-                alert.state = "Cancelled"
-                continue
-            if alert.attempts >= 5:
-                alert.state = "Failed"
-                continue
-            alert.attempts += 1
-            try:
-                sent = mail.send(
-                    f"NewHotMusic: {issue.title}",
-                    f"{issue.meaning}\n\n{issue.technical}\n\nRecommended action: {issue.action}",
-                    [
-                        x.strip()
-                        for x in config().alert_recipients.split(",")
-                        if x.strip()
-                    ],
-                )
-                alert.state = "Sent" if sent else "Not Configured"
-                if sent:
-                    alert.sent_at = now()
-                else:
-                    alert.attempts -= 1
-            except Exception as exc:
-                alert.state = "Retrying"
-                alert.error = type(exc).__name__
-            audit(db, "worker", "Alert delivery", alert_id=alert.id, state=alert.state)
-        db.commit()
+    with engine.connect() as lock, Session() as db:
+        if not lock.scalar(text("SELECT pg_try_advisory_lock(987655)")):
+            return
+        try:
+            if config().demo_mode:
+                return
+            for domain_id in db.scalars(
+                select(Domain.id).where(Domain.active.is_(True))
+            ):
+                enqueue_digest(db, domain_id)
+            db.commit()
+            send_outbox(db)
+        finally:
+            lock.execute(text("SELECT pg_advisory_unlock(987655)"))
+            lock.commit()
